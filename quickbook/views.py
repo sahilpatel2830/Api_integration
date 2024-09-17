@@ -1,3 +1,4 @@
+from logging import exception
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -33,10 +34,11 @@ class QuickBookBaseView(APIView):
                 headers = self.get_header()
                 response = requests.request(method, url, json=data, headers=headers, params=params)
             return response
-        except requests.exceptions.RequestException as e:
-            error_message = response if isinstance(response, str) else response.json()
+        except requests.exceptions.RequestException as request_exception:
+            return Response({"message": str(request_exception)}, status=status.HTTP_400_BAD_REQUEST)
 
-            return Response({"error": error_message}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception:
+            return Response("Something went wrong. Please try again later", status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class EmployeeCreateView(QuickBookBaseView):
@@ -59,7 +61,7 @@ class EmployeeCreateView(QuickBookBaseView):
             if data.get('QueryResponse', {}).get('Employee'):
                 return Response({"message": f"Employee with the GivenName {employee_data['GivenName']} and FamilyName {employee_data['FamilyName']} is already exists."}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            return Response({"message": "Somthing went wrong.Please try again later."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"message": "Something went wrong.Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         quickbooks_url = f'https://sandbox-quickbooks.api.intuit.com/v3/company/{self.realm_id}/employee?minorversion=73'
         create_emp_response = self.send_request(quickbooks_url, 'post', data=employee_data)
@@ -71,6 +73,62 @@ class EmployeeCreateView(QuickBookBaseView):
             return Response({"message": "Bad request.","error":create_emp_response.json()}, status=status.HTTP_400_BAD_REQUEST)
         else:
             return Response({"message": "Somthing went wrong. Please try again later.","error": create_emp_response.text}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class BulkEmployeeCreateView(QuickBookBaseView):
+    def post(self, request):
+        employees = request.data
+        if not isinstance(employees, list):
+            return Response({"error": "Request data should be list of employee dict."}, status=status.HTTP_400_BAD_REQUEST)
+
+        employee_res = []
+        for emp_data in employees:
+            serializer = EmployeeSerializer(data=emp_data)
+            if not serializer.is_valid():
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+            validate_emp_data = serializer.data
+
+            quickbooks_url = f'https://sandbox-quickbooks.api.intuit.com/v3/company/{self.realm_id}/employee?minorversion=73'
+            create_emp_response = self.send_request(quickbooks_url, 'post', data=validate_emp_data)
+
+            if create_emp_response.status_code == 200:
+                employee_info = create_emp_response.json().get("Employee", {})
+                employee_res.append({
+                    "is_new_emp": True,
+                    "GivenName": employee_info.get("GivenName"),
+                    "FamilyName": employee_info.get("FamilyName"),
+                    "id": employee_info.get("Id")
+                })
+
+            elif create_emp_response.status_code == 400:
+                create_error_data = create_emp_response.json()
+                if "Fault" in create_error_data and "Error" in create_error_data["Fault"]:
+                    error_details = create_error_data["Fault"]["Error"][0]
+
+                    if error_details.get("code") == "6240":
+                        employee_id = error_details.get("Detail").split("Id=")[-1]
+
+                        employee_res.append({
+                            "is_new_emp": False,
+                            "GivenName": validate_emp_data.get("GivenName"),
+                            "FamilyName": validate_emp_data.get("FamilyName"),
+                            "Id": employee_id,
+                        })
+
+                    else:
+                        employee_res.append({
+                            "status": "failed to create",
+                            "error": create_error_data
+                        })
+
+                else:
+                    employee_res.append({
+                        "status": "failed to create",
+                        "error": employee_res.text
+                    })
+
+        return Response(employee_res, status=status.HTTP_200_OK)
 
 
 class QuickBooksInvoiceCreateView(QuickBookBaseView):
@@ -133,4 +191,12 @@ class QuickBookTimeActivity(QuickBookBaseView):
                 {"message": "Somthing went wrong. Please try again later.", "error": create_timeactivity_response.text},
                 status=status.HTTP_400_BAD_REQUEST)
 
+
+class QuickBooksEmployeeReadView(QuickBookBaseView):
+    def get(self, request, employee_id):
+        url = f'https://sandbox-quickbooks.api.intuit.com/v3/company/{self.realm_id}/employee/{employee_id}?minorversion=73'
+        res = self.send_request(url, 'get')
+        if res.status_code == 200:
+            return Response({"data": res.json().get("Employee", {}), "message": "Employee details fetched successfully"}, status=status.HTTP_200_OK)
+        return Response({"error": res.json()}, status=status.HTTP_200_OK)
 
