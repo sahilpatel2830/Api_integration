@@ -1,4 +1,4 @@
-from logging import exception
+from oauthlib.uri_validate import query
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -75,7 +75,7 @@ class EmployeeCreateView(QuickBookBaseView):
             return Response({"message": "Somthing went wrong. Please try again later.","error": create_emp_response.text}, status=status.HTTP_400_BAD_REQUEST)
 
 
-class BulkEmployeeCreateView(QuickBookBaseView):
+class SyncEmployeeCreateView(QuickBookBaseView):
     def post(self, request):
         employees = request.data
         if not isinstance(employees, list):
@@ -121,14 +121,15 @@ class BulkEmployeeCreateView(QuickBookBaseView):
                             "status": "failed to create",
                             "error": create_error_data
                         })
-
                 else:
                     employee_res.append({
                         "status": "failed to create",
                         "error": employee_res.text
                     })
+            else:
+                return Response({"message": "Something went wrong. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        return Response(employee_res, status=status.HTTP_200_OK)
+        return Response({"message": "Sync Employee created successfully.", "data": employee_res}, status=status.HTTP_200_OK)
 
 
 class QuickBooksInvoiceCreateView(QuickBookBaseView):
@@ -170,12 +171,93 @@ class QuickBooksCustomerCreateView(QuickBookBaseView):
         else:
             return Response({"message": "Somthing went wrong. Please try again later.","error": create_customer_response.text}, status=status.HTTP_400_BAD_REQUEST)
 
+class SyncCustomerCreateView(QuickBookBaseView):
+    def post(self,request):
+        customers = request.data
+        if not isinstance(customers, list):
+            return Response({"error":"Request data should be list of customers dict."},status=status.HTTP_400_BAD_REQUEST)
+
+        customers_res = []
+
+
+        for customer_data in customers:
+            serializer = CustomerSerializer(data=customer_data)
+            if not serializer.is_valid():
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+            validate_customer_data = serializer.data
+
+            query = (
+                f"SELECT * FROM Customer WHERE DisplayName = '{validate_customer_data['DisplayName']}'"
+            )
+
+            quickbooks_query_url = f'https://sandbox-quickbooks.api.intuit.com/v3/company/{self.realm_id}/query?minorversion=73'
+            query_response = self.send_request(quickbooks_query_url,'get', params={'query': query})
+
+            if query_response.status_code == 200:
+                query_data = query_response.json().get('QueryResponse', {}).get('Customer',[])
+
+                if query_data:
+                    existing_customer = query_data[0]
+                    customers_res.append({
+                        "is_new_customer": False,
+                        "DisplayName": existing_customer.get("DisplayName"),
+                        "GivenName": existing_customer.get("GivenName"),
+                        "Id": existing_customer.get("Id"),
+                    })
+                    continue
+
+            url = f'https://sandbox-quickbooks.api.intuit.com/v3/company/{self.realm_id}/customer?minorversion=73'
+            create_customer_response = self.send_request(url, 'post', data=validate_customer_data)
+
+            if create_customer_response.status_code == 200:
+                customer_info = create_customer_response.json().get("Customer",{})
+                customers_res.append({
+                    "is_new_customer": True,
+                    "DisplayName": customer_info.get("DisplayName"),
+                    "GivenName": customer_info.get("GivenName"),
+                    "id": customer_info.get("Id")
+                })
+
+            elif create_customer_response.status_code == 400:
+                create_error_data = create_customer_response.json()
+
+                if "Fault" in create_error_data and "Error" in create_error_data["Fault"]:
+                    error_details = create_error_data["Fault"]["Error"][0]
+
+                    if error_details.get("code") == "6240":
+                        customer_id = error_details.get("Detail").split("Id=")[-1]
+
+                        customers_res.append({
+                            "is_new_emp": False,
+                            "DisplayName": validate_customer_data.get("DisplayName"),
+                            "GivenName": validate_customer_data.get("GivenName"),
+                            "Id": customer_id,
+                        })
+
+                    else:
+                        customers_res.append({
+                            "status": "failed to create",
+                            "error": create_error_data
+                        })
+                else:
+                    customers_res.append({
+                        "status": "failed to create",
+                        "error": customers_res.text
+                    })
+            else:
+                return Response({"message": "Something went wrong. Please try again later."},status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({"message": "Sync Customer created successfully.", "data": customers_res},
+                        status=status.HTTP_200_OK)
+
+
 
 class QuickBookTimeActivity(QuickBookBaseView):
     def post(self, request):
         serializer = TimeactivitySerializer(data=request.data)
         if not serializer.is_valid():
-            return Response(serializer.errors,status=status.HTTP_400_BAD_REQUEST)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         timeactivity_Data = serializer.data
         url = f'https://sandbox-quickbooks.api.intuit.com/v3/company/9341452978640153/timeactivity?minorversion=73'
